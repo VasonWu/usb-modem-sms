@@ -140,6 +140,47 @@ data class Telemetry(
     val registered: Boolean = false,
 )
 
+/** 通话状态 */
+enum class CallState {
+    IDLE,        // 空闲
+    DIALING,     // 拨号中（主叫）
+    RINGING,     // 振铃（被叫）
+    CONNECTED,   // 通话中
+    DISCONNECTED // 刚挂断
+}
+
+/** 通话方向 */
+enum class CallDirection { OUTGOING, INCOMING }
+
+/** 单条通话记录 */
+data class CallLogEntry(
+    val id: Long = System.currentTimeMillis(),
+    val number: String,
+    val direction: CallDirection,
+    val startTime: Long,
+    val durationSec: Int = 0,
+    val missed: Boolean = false,
+)
+
+/** 当前通话信息 */
+data class ActiveCall(
+    val state: CallState = CallState.IDLE,
+    val number: String = "",
+    val direction: CallDirection = CallDirection.OUTGOING,
+    val startTime: Long = 0,
+    val muted: Boolean = false,
+    val speakerOn: Boolean = false,
+    val held: Boolean = false,
+)
+
+/** 通话音频模式 */
+enum class AudioMode {
+    Earpiece,  // 听筒
+    Speaker,   // 免提
+    Bluetooth, // 蓝牙
+    Usb,       // USB 音频
+}
+
 class Modem(private val ctx: Context) {
 
     private var conn: UsbDeviceConnection? = null
@@ -155,6 +196,15 @@ class Modem(private val ctx: Context) {
     private var prepared = false
 
     var onNewSms: (() -> Unit)? = null
+
+    /** 来电振铃回调（+RING） */
+    var onRinging: (() -> Unit)? = null
+
+    /** 通话建立回调 */
+    var onCallConnected: (() -> Unit)? = null
+
+    /** 通话结束回调 */
+    var onCallEnded: (() -> Unit)? = null
 
     @Volatile
     var storage: String = "ME"
@@ -351,14 +401,19 @@ class Modem(private val ctx: Context) {
 
                 // URC 必须在累积缓冲上匹配。USB 可能把 "+CMTI" 拆到两个包里，
                 // 只看单个数据块会漏掉。
-                val hit = synchronized(urc) {
+                val (smsHit, ringHit, endHit) = synchronized(urc) {
                     urc.append(s)
                     if (urc.length > URC_TAIL) urc.delete(0, urc.length - URC_TAIL)
-                    if (urc.contains("+CMTI")) {
-                        urc.setLength(0); true
-                    } else false
+                    val sms = urc.contains("+CMTI")
+                    val ring = urc.contains("RING")
+                    val end = urc.contains("NO CARRIER") || urc.contains("BUSY") ||
+                              urc.contains("NO ANSWER") || urc.contains("+CIEV: call,0")
+                    if (sms || ring || end) urc.setLength(0)
+                    Triple(sms, ring, end)
                 }
-                if (hit) onNewSms?.invoke()
+                if (smsHit) onNewSms?.invoke()
+                if (ringHit) onRinging?.invoke()
+                if (endHit) onCallEnded?.invoke()
             }
         }
     }
@@ -655,6 +710,102 @@ class Modem(private val ctx: Context) {
     }
 
     suspend fun raw(cmd: String): String = ioLock.withLock { at(cmd, timeoutMs = 15000) }
+
+    // ---------- 通话控制 ----------
+
+    /** 拨号。返回 null 表示成功。 */
+    suspend fun dial(number: String): String? = ioLock.withLock {
+        prepare()
+        if (number.isBlank()) return@withLock "号码不能为空"
+        // ATD 后面加分号表示语音呼叫（不切换数据模式）
+        val r = at("ATD$number;", timeoutMs = 30000, expect = "OK")
+        when {
+            r.contains("OK") -> null
+            r.contains("NO CARRIER") -> "无载波，对方可能挂断或无法接通"
+            r.contains("BUSY") -> "对方忙线"
+            r.contains("NO DIALTONE") -> "无拨号音"
+            r.contains("ERROR") -> "拨号失败：${r.trim().lines().lastOrNull()}"
+            else -> "拨号未知结果"
+        }
+    }
+
+    /** 接听来电。返回 null 表示成功。 */
+    suspend fun answer(): String? = ioLock.withLock {
+        val r = at("ATA", timeoutMs = 10000)
+        if (r.contains("OK")) null else "接听失败"
+    }
+
+    /** 挂断通话。返回 null 表示成功。 */
+    suspend fun hangup(): String? = ioLock.withLock {
+        val r = at("ATH", timeoutMs = 5000)
+        if (r.contains("OK")) null else "挂断失败"
+    }
+
+    /** 发送 DTMF 按键音。 */
+    suspend fun sendDtmf(digit: Char): String? = ioLock.withLock {
+        // 用 +VTS 发送 DTMF
+        val r = at("AT+VTS=$digit", timeoutMs = 3000)
+        if (r.contains("OK")) null else "发送DTMF失败"
+    }
+
+    // ---------- 音频配置 ----------
+
+    /**
+     * 配置 USB 音频路径。
+     * 这是"对方听不到我说话"的关键修复：
+     * - QAUDMOD=0 设置为 USB 音频模式
+     * - QMIC 开启麦克风并设置增益
+     */
+    suspend fun setupUsbAudio(): String? = ioLock.withLock {
+        prepare()
+        // 设置音频模式：0 = USB 音频
+        val r1 = at("AT+QAUDMOD=0")
+        if (r1.contains("ERROR")) {
+            // 部分固件用 +QAUDCFG 配置
+            val r1b = at("AT+QAUDCFG=\"audiodac\",1")
+            if (r1b.contains("ERROR")) return@withLock "设置音频模式失败"
+        }
+        // 启用麦克风并设置合适增益 (增益范围因固件而异，先试中间值)
+        at("AT+QMIC=1,10")
+        // 确保不静音
+        at("AT+QMUT=0")
+        // 设置扬声器音量
+        at("AT+QSIDET=0,50")
+        null
+    }
+
+    /** 查询当前音频模式 */
+    suspend fun queryAudioMode(): String = ioLock.withLock {
+        prepare()
+        runCatching { at("AT+QAUDMOD?", timeoutMs = 3000) }.getOrDefault("查询失败")
+    }
+
+    // ---------- 来电号码识别 ----------
+
+    /** 启用来电显示上报 */
+    suspend fun enableCallerId(): String? = ioLock.withLock {
+        prepare()
+        val r = at("AT+CLIP=1")
+        if (r.contains("OK")) null else "启用来电显示失败"
+    }
+
+    /** 读取最近一次来电号码（从缓冲区解析 +CLIP） */
+    fun lastIncomingNumber(): String? {
+        val s = synchronized(buf) { buf.toString() }
+        return Regex("""\+CLIP:\s*"([^"]*)"""").find(s)?.groupValues?.get(2)
+    }
+
+    /** 查询当前通话状态 */
+    suspend fun callStatus(): Int? = ioLock.withLock {
+        prepare()
+        val r = at("AT+CLCC", timeoutMs = 3000)
+        // 解析 +CLCC: idx,dir,status,mode,mpty,number,...
+        // status: 0=active, 1=held, 2=dialing, 3=alerting, 4=incoming, 5=waiting
+        if (r.contains("+CLCC:")) {
+            Regex("""\+CLCC:\s*\d+,\d+,(\d+)""").find(r)
+                ?.groupValues?.get(1)?.toIntOrNull()
+        } else null
+    }
 }
 
 // ---------- UCS2 ----------

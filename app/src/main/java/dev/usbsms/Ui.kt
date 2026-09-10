@@ -82,6 +82,24 @@ fun Screen(
     supported: List<String>,
     current: String,
     snackbar: SnackbarHostState,
+    // 通话相关
+    currentTab: Tab,
+    onTabChange: (Tab) -> Unit,
+    call: ActiveCall,
+    callDurationSec: Int,
+    callLog: List<CallLogEntry>,
+    showDialPad: Boolean,
+    onToggleDialPad: () -> Unit,
+    showCallScreen: Boolean,
+    onCall: (String) -> Unit,
+    onAnswer: () -> Unit,
+    onHangup: () -> Unit,
+    onToggleMute: () -> Unit,
+    onToggleSpeaker: () -> Unit,
+    onSendDtmf: (Char) -> Unit,
+    onDismissCallScreen: () -> Unit,
+    onClearCallLog: () -> Unit,
+    // 原有功能
     onConnect: () -> Unit,
     onRefresh: () -> Unit,
     onPickStorage: (String) -> Unit,
@@ -105,6 +123,8 @@ fun Screen(
     var confirmMode by remember { mutableStateOf<NetMode?>(null) }
     var consoleOpen by remember { mutableStateOf(false) }
     var ifaceOpen by remember { mutableStateOf(false) }
+    var callNumber by remember { mutableStateOf("") }
+    var clearConfirm by remember { mutableStateOf(false) }
 
     confirmFlag?.let { flag ->
         AlertDialog(
@@ -126,6 +146,25 @@ fun Screen(
             },
             dismissButton = {
                 TextButton(onClick = { confirmFlag = null }) { Text("取消", color = TextLo) }
+            },
+        )
+    }
+
+    if (clearConfirm) {
+        AlertDialog(
+            containerColor = Panel,
+            titleContentColor = TextHi,
+            textContentColor = TextLo,
+            onDismissRequest = { clearConfirm = false },
+            title = { Text("清空通话记录") },
+            text = { Text("全部通话记录会被删除，无法恢复。") },
+            confirmButton = {
+                TextButton(onClick = { onClearCallLog(); clearConfirm = false }) {
+                    Text("清空", color = Alert)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { clearConfirm = false }) { Text("取消", color = TextLo) }
             },
         )
     }
@@ -190,65 +229,105 @@ fun Screen(
         )
     }
 
+    // 拨号盘
+    if (showDialPad) {
+        DialPadDialog(
+            number = callNumber,
+            onNumberChange = { callNumber = it },
+            onDismiss = { onToggleDialPad() },
+            onCall = {
+                onCall(callNumber)
+                callNumber = ""
+            },
+        )
+    }
+
+    // 通话中全屏界面
+    if (showCallScreen && call.state != CallState.IDLE) {
+        CallScreen(
+            call = call,
+            durationSec = callDurationSec,
+            onAnswer = onAnswer,
+            onHangup = onHangup,
+            onToggleMute = onToggleMute,
+            onToggleSpeaker = onToggleSpeaker,
+            onSendDtmf = onSendDtmf,
+            onDismiss = onDismissCallScreen,
+        )
+    }
+
     Box(Modifier.fillMaxSize().background(Ink)) {
         Column(
             Modifier
                 .fillMaxSize()
-                .widthIn(max = 680.dp)          // 平板/折叠屏上不要拉太宽
+                .widthIn(max = 680.dp)
                 .align(Alignment.TopCenter)
                 .windowInsetsPadding(WindowInsets.safeDrawing)
         ) {
 
-            Header(connected, busy, onConnect, onRefresh, menuOpen,
-                { menuOpen = it }, { confirmFlag = it }, { modeSheet = true; onReadMode() },
-                { consoleOpen = true },
-                { ifaceOpen = true; onRefreshIfaces() })
-
+            // 顶部状态行（所有 Tab 共享）
             TelemetryStrip(connected, tele, status, netMode, atIf)
 
-            if (connected && supported.isNotEmpty()) {
-                StorageRow(supported, storages, current, busy, onPickStorage)
-            }
-
-            Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
-
-            if (!connected) {
-                Column(
-                    Modifier.weight(1f).fillMaxWidth().padding(24.dp),
-                    verticalArrangement = Arrangement.Center,
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text("未连接模块", color = TextLo, fontSize = 15.sp)
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "连接时会自动遍历所有接口探测 AT 口，" +
-                            "切换过 USB 模式导致串口移位也能找回来。" +
-                            "刚重启过模块的话可能要等一会儿。",
-                        style = Readout, color = Hairline,
-                        lineHeight = 17.sp,
+            // 内容区
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                when (currentTab) {
+                    Tab.CALL -> CallTab(
+                        connected = connected,
+                        callLog = callLog,
+                        onClearLog = { clearConfirm = true },
+                        onCall = { num -> onCall(num) },
+                        onOpenDialPad = onToggleDialPad,
                     )
-                    Spacer(Modifier.height(16.dp))
-                    Pill("连接", Amber, Ink, onClick = onConnect)
-                }
-            } else if (sms.isEmpty()) {
-                Empty(connected, current, Modifier.weight(1f))
-            } else {
-                LazyColumn(
-                    Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                    contentPadding = PaddingValues(16.dp),
-                ) {
-                    items(sms, key = { it.index }) { m ->
-                        MessageCard(m, busy, onDeleteOne, onCopied)
-                    }
+                    Tab.LOG -> CallLogTab(
+                        callLog = callLog,
+                        onClearLog = { clearConfirm = true },
+                        onCall = { num -> onCall(num) },
+                    )
+                    Tab.SMS -> SmsTab(
+                        connected = connected,
+                        busy = busy,
+                        sms = sms,
+                        storages = storages,
+                        supported = supported,
+                        current = current,
+                        onRefresh = onRefresh,
+                        onPickStorage = onPickStorage,
+                        onDeleteOne = onDeleteOne,
+                        onCopied = onCopied,
+                        status = status,
+                    )
+                    Tab.SETTINGS -> SettingsTab(
+                        connected = connected,
+                        busy = busy,
+                        onConnect = onConnect,
+                        onModeClick = { modeSheet = true; onReadMode() },
+                        onConsoleClick = { consoleOpen = true },
+                        onIfaceClick = { ifaceOpen = true; onRefreshIfaces() },
+                        onDeleteRead = { confirmFlag = 1 },
+                        onDeleteAll = { confirmFlag = 4 },
+                    )
                 }
             }
 
-            Composer(
-                number, { number = it }, text, { text = it },
-                enabled = connected && !busy,
-                onSend = { onSend(number, text); text = "" },
-            )
+            // 底部导航栏
+            BottomNav(currentTab, onTabChange, onToggleDialPad)
+        }
+
+        // 短信发送栏（只在短信页显示）
+        if (currentTab == Tab.SMS) {
+            Box(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 56.dp)  // 底部导航栏高度
+                    .fillMaxWidth()
+                    .widthIn(max = 680.dp)
+            ) {
+                Composer(
+                    number, { number = it }, text, { text = it },
+                    enabled = connected && !busy,
+                    onSend = { onSend(number, text); text = "" },
+                )
+            }
         }
 
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding())
@@ -615,6 +694,659 @@ private fun Field(
             ),
             modifier = Modifier.fillMaxWidth(),
         )
+    }
+}
+
+// ---------- 底部导航 ----------
+
+@Composable
+private fun BottomNav(
+    current: Tab,
+    onChange: (Tab) -> Unit,
+    onDialPad: () -> Unit,
+) {
+    val items = listOf(
+        Tab.CALL to "电话",
+        Tab.LOG to "记录",
+        Tab.SMS to "短信",
+        Tab.SETTINGS to "配置",
+    )
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Panel)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        items.forEach { (tab, label) ->
+            Box(
+                Modifier
+                    .weight(1f)
+                    .clickable { onChange(tab) }
+                    .padding(vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        tabIcon(tab),
+                        fontSize = 20.sp,
+                        color = if (current == tab) Amber else TextLo,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        label,
+                        style = Readout,
+                        color = if (current == tab) Amber else TextLo,
+                        fontSize = 10.sp,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun tabIcon(tab: Tab): String = when (tab) {
+    Tab.CALL -> "📞"
+    Tab.LOG -> "📋"
+    Tab.SMS -> "💬"
+    Tab.SETTINGS -> "⚙️"
+}
+
+// ---------- 电话 Tab ----------
+
+@Composable
+private fun CallTab(
+    connected: Boolean,
+    callLog: List<CallLogEntry>,
+    onClearLog: () -> Unit,
+    onCall: (String) -> Unit,
+    onOpenDialPad: () -> Unit,
+) {
+    val recent = callLog.take(10)
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("最近通话", color = TextHi, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            if (callLog.isNotEmpty()) {
+                Text("清空", style = Readout, color = TextLo,
+                    modifier = Modifier
+                        .clickable { onClearLog() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp))
+            }
+        }
+
+        if (!connected) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("模块未连接", color = TextLo, fontSize = 14.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("连接后才能拨打电话", style = Readout, color = Hairline)
+                }
+            }
+        } else if (recent.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("暂无通话记录", color = TextLo, fontSize = 14.sp)
+                    Spacer(Modifier.height(12.dp))
+                    Pill("打开拨号盘", Amber, Ink, onClick = onOpenDialPad)
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 80.dp),
+            ) {
+                items(recent, key = { it.id }) { entry ->
+                    CallLogRow(entry) { onCall(entry.number) }
+                }
+            }
+        }
+    }
+}
+
+// ---------- 通话记录 Tab ----------
+
+@Composable
+private fun CallLogTab(
+    callLog: List<CallLogEntry>,
+    onClearLog: () -> Unit,
+    onCall: (String) -> Unit,
+) {
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("通话记录", color = TextHi, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            if (callLog.isNotEmpty()) {
+                Text("清空", style = Readout, color = TextLo,
+                    modifier = Modifier
+                        .clickable { onClearLog() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp))
+            }
+        }
+        if (callLog.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("暂无通话记录", color = TextLo, fontSize = 14.sp)
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 80.dp),
+            ) {
+                items(callLog, key = { it.id }) { entry ->
+                    CallLogRow(entry) { onCall(entry.number) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            if (entry.direction == CallDirection.OUTGOING) "↗" else "↙",
+            fontSize = 18.sp,
+            color = when {
+                entry.missed -> Alert
+                entry.direction == CallDirection.OUTGOING -> Signal
+                else -> Amber
+            },
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                entry.number.ifBlank { "未知号码" },
+                color = TextHi,
+                fontSize = 14.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(Modifier.height(2.dp))
+            val timeStr = runCatching {
+                java.text.SimpleDateFormat("MM/dd HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(entry.startTime))
+            }.getOrDefault("")
+            val detail = buildString {
+                append(timeStr)
+                if (entry.direction == CallDirection.OUTGOING && entry.durationSec > 0) {
+                    val m = entry.durationSec / 60
+                    val s = entry.durationSec % 60
+                    append("  ·  %02d:%02d".format(m, s))
+                }
+                if (entry.missed) append("  ·  未接")
+            }
+            Text(detail, style = Readout, color = TextLo)
+        }
+        Text("拨打", style = Readout, color = Amber)
+    }
+}
+
+// ---------- 短信 Tab ----------
+
+@Composable
+private fun SmsTab(
+    connected: Boolean,
+    busy: Boolean,
+    sms: List<Sms>,
+    storages: List<Storage>,
+    supported: List<String>,
+    current: String,
+    onRefresh: () -> Unit,
+    onPickStorage: (String) -> Unit,
+    onDeleteOne: (Int) -> Unit,
+    onCopied: (String) -> Unit,
+    status: String,
+) {
+    Column(Modifier.fillMaxSize()) {
+        // 短信页标题栏
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("短信", color = TextHi, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            if (connected) {
+                Text("刷新", style = Readout, color = Amber,
+                    modifier = Modifier
+                        .clickable(enabled = !busy) { onRefresh() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp))
+            }
+        }
+
+        if (connected && supported.isNotEmpty()) {
+            StorageRow(supported, storages, current, busy, onPickStorage)
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
+
+        if (!connected) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("模块未连接", color = TextLo, fontSize = 14.sp)
+            }
+        } else if (sms.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Empty(connected, current, Modifier.padding(bottom = 200.dp))
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(16.dp, top = 10.dp, bottom = 220.dp),
+            ) {
+                items(sms, key = { it.index }) { m ->
+                    MessageCard(m, busy, onDeleteOne, onCopied)
+                }
+            }
+        }
+    }
+}
+
+// ---------- 配置 Tab ----------
+
+@Composable
+private fun SettingsTab(
+    connected: Boolean,
+    busy: Boolean,
+    onConnect: () -> Unit,
+    onModeClick: () -> Unit,
+    onConsoleClick: () -> Unit,
+    onIfaceClick: () -> Unit,
+    onDeleteRead: () -> Unit,
+    onDeleteAll: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("模块", color = Amber, style = Readout,
+            modifier = Modifier.padding(top = 4.dp, bottom = 4.dp))
+        SettingItem("USB 网络模式", "切换 ECM / MBIM / QMI / RNDIS", onClick = onModeClick)
+        SettingItem("AT 控制台", "直接下发 AT 指令", onClick = onConsoleClick)
+        SettingItem("USB 接口一览", "查看当前接口布局", onClick = onIfaceClick)
+
+        Spacer(Modifier.height(8.dp))
+        Text("短信", color = Amber, style = Readout,
+            modifier = Modifier.padding(top = 4.dp, bottom = 4.dp))
+        SettingItem("删除已读短信", "仅保留未读的", onClick = onDeleteRead)
+        SettingItem("删除全部短信", "清空模块存储区", color = Alert, onClick = onDeleteAll)
+
+        Spacer(Modifier.height(8.dp))
+        Text("连接", color = Amber, style = Readout,
+            modifier = Modifier.padding(top = 4.dp, bottom = 4.dp))
+        SettingItem(
+            if (connected) "重新连接模块" else "连接模块",
+            "重新探测 AT 口",
+            onClick = onConnect,
+        )
+
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "通话音频说明：\n" +
+                "通话使用模块的 USB 音频接口（UAC）。\n" +
+                "• 确保模块的 USB 音频接口已被系统识别\n" +
+                "• 授予录音权限后对方才能听到你说话\n" +
+                "• 默认走 USB 音频，可在通话中切换免提",
+            style = Readout, color = Hairline, lineHeight = 16.sp,
+        )
+    }
+}
+
+@Composable
+private fun SettingItem(
+    title: String,
+    desc: String,
+    color: Color = TextHi,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Panel, RoundedCornerShape(10.dp))
+            .clickable { onClick() }
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = color, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(2.dp))
+            Text(desc, style = Readout, color = TextLo)
+        }
+        Text("›", color = Hairline, fontSize = 18.sp)
+    }
+}
+
+// ---------- 拨号盘 ----------
+
+@Composable
+private fun DialPadDialog(
+    number: String,
+    onNumberChange: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onCall: () -> Unit,
+) {
+    AlertDialog(
+        containerColor = Panel,
+        titleContentColor = TextHi,
+        onDismissRequest = onDismiss,
+        title = { Text("拨号") },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                // 号码显示
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Ink, RoundedCornerShape(8.dp))
+                        .padding(12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        number.ifBlank { "输入号码" },
+                        color = if (number.isBlank()) TextLo else TextHi,
+                        fontSize = 22.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+
+                // 12 键拨号盘
+                val keys = listOf(
+                    listOf("1", "2", "3"),
+                    listOf("4", "5", "6"),
+                    listOf("7", "8", "9"),
+                    listOf("*", "0", "#"),
+                )
+                keys.forEach { row ->
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        row.forEach { key ->
+                            Box(
+                                Modifier
+                                    .weight(1f)
+                                    .background(PanelHi, RoundedCornerShape(8.dp))
+                                    .clickable { onNumberChange(number + key) }
+                                    .padding(vertical = 12.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(key, color = TextHi, fontSize = 20.sp,
+                                    fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+                // 底部：删除键 + 拨号键
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(Modifier.weight(1f))
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .background(Signal, RoundedCornerShape(50))
+                            .clickable { if (number.isNotBlank()) onCall() }
+                            .padding(vertical = 12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("📞", fontSize = 22.sp)
+                    }
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .clickable {
+                                if (number.isNotEmpty())
+                                    onNumberChange(number.dropLast(1))
+                            }
+                            .padding(vertical = 12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("⌫", color = TextLo, fontSize = 20.sp)
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("关闭", color = TextLo) }
+        },
+    )
+}
+
+// ---------- 通话中界面 ----------
+
+@Composable
+private fun CallScreen(
+    call: ActiveCall,
+    durationSec: Int,
+    onAnswer: () -> Unit,
+    onHangup: () -> Unit,
+    onToggleMute: () -> Unit,
+    onToggleSpeaker: () -> Unit,
+    onSendDtmf: (Char) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val mins = durationSec / 60
+    val secs = durationSec % 60
+    val timeStr = "%02d:%02d".format(mins, secs)
+
+    var showDtmf by remember { mutableStateOf(false) }
+
+    androidx.compose.material3.Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = Ink,
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Spacer(Modifier.height(40.dp))
+
+            // 号码
+            Text(
+                call.number.ifBlank { "未知号码" },
+                color = TextHi,
+                fontSize = 28.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(8.dp))
+
+            // 状态
+            Text(
+                when (call.state) {
+                    CallState.DIALING -> "正在呼叫…"
+                    CallState.RINGING -> "来电…"
+                    CallState.CONNECTED -> timeStr
+                    else -> ""
+                },
+                color = if (call.state == CallState.CONNECTED) Signal else TextLo,
+                style = Readout,
+                fontSize = 14.sp,
+            )
+
+            // 波形动画（简化版）
+            Spacer(Modifier.height(40.dp))
+            if (call.state == CallState.CONNECTED) {
+                AudioWaveform()
+            } else {
+                Box(Modifier.size(160.dp), contentAlignment = Alignment.Center) {
+                    Text("📞", fontSize = 80.sp)
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // DTMF 键盘（通话中展开）
+            if (call.state == CallState.CONNECTED && showDtmf) {
+                val keys = listOf(
+                    listOf("1", "2", "3"),
+                    listOf("4", "5", "6"),
+                    listOf("7", "8", "9"),
+                    listOf("*", "0", "#"),
+                )
+                Column(
+                    Modifier.fillMaxWidth(0.7f),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    keys.forEach { row ->
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            row.forEach { key ->
+                                Box(
+                                    Modifier
+                                        .weight(1f)
+                                        .background(PanelHi, RoundedCornerShape(6.dp))
+                                        .clickable { onSendDtmf(key[0]) }
+                                        .padding(vertical = 8.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(key, color = TextHi, fontSize = 16.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
+
+            // 控制按钮
+            if (call.state == CallState.CONNECTED) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    CallActionButton(
+                        icon = if (call.muted) "🔇" else "🎤",
+                        label = if (call.muted) "取消静音" else "静音",
+                        active = call.muted,
+                        onClick = onToggleMute,
+                    )
+                    CallActionButton(
+                        icon = "⌨️",
+                        label = "键盘",
+                        active = showDtmf,
+                        onClick = { showDtmf = !showDtmf },
+                    )
+                    CallActionButton(
+                        icon = if (call.speakerOn) "🔊" else "👂",
+                        label = if (call.speakerOn) "免提" else "听筒",
+                        active = call.speakerOn,
+                        onClick = onToggleSpeaker,
+                    )
+                }
+                Spacer(Modifier.height(20.dp))
+            }
+
+            // 接听 / 挂断
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(40.dp),
+            ) {
+                if (call.state == CallState.RINGING) {
+                    CallActionButton(
+                        icon = "📞",
+                        label = "接听",
+                        bg = Signal,
+                        onClick = onAnswer,
+                    )
+                }
+                CallActionButton(
+                    icon = "📴",
+                    label = "挂断",
+                    bg = Alert,
+                    onClick = onHangup,
+                )
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // 最小化（仅通话中）
+            if (call.state == CallState.CONNECTED) {
+                Text("返回后台", style = Readout, color = Hairline,
+                    modifier = Modifier.clickable { onDismiss() })
+            }
+        }
+    }
+}
+
+@Composable
+private fun CallActionButton(
+    icon: String,
+    label: String,
+    bg: Color = PanelHi,
+    active: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            Modifier
+                .size(56.dp)
+                .background(
+                    if (active) Amber.copy(alpha = 0.2f) else bg,
+                    CircleShape,
+                )
+                .border(
+                    1.dp,
+                    if (active) Amber else Hairline,
+                    CircleShape,
+                )
+                .clickable { onClick() },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(icon, fontSize = 24.sp)
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(label, style = Readout, color = TextLo, fontSize = 10.sp)
+    }
+}
+
+@Composable
+private fun AudioWaveform() {
+    val transition = rememberInfiniteTransition("wave")
+    val scale by transition.animateFloat(
+        initialValue = 0.6f,
+        targetValue = 1.2f,
+        animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse),
+        label = "wave-scale",
+    )
+    Canvas(Modifier.size(180.dp)) {
+        val cx = size.width / 2
+        val cy = size.height / 2
+        for (i in 0..2) {
+            val s = scale + i * 0.2f
+            val alpha = (1f - i * 0.3f) * 0.5f
+            drawCircle(
+                color = Signal.copy(alpha = alpha),
+                radius = 40.dp.toPx() * s.coerceIn(0.5f, 2f),
+                center = androidx.compose.ui.geometry.Offset(cx, cy),
+            )
+        }
     }
 }
 
