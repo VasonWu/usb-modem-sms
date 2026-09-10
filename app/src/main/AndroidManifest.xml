@@ -3,18 +3,6 @@
 
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
 
-    <!-- 通话与音频相关权限 -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -23,12 +11,6 @@
         android:supportsRtl="true"
         android:enableOnBackInvokedCallback="true"
         android:theme="@style/AppTheme">
-
-        <!-- 通话前台服务 -->
-        <service
-            android:name=".CallService"
-            android:foregroundServiceType="phoneCall|microphone"
-            android:exported="false" />
 
         <activity
             android:name=".MainActivity"

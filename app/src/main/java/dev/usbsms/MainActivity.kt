@@ -1,44 +1,28 @@
 package dev.usbsms
 
-import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
-import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
-import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-
-enum class Tab { CALL, LOG, SMS, SETTINGS }
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var modem: Modem
-
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ ->
-        // 权限结果不需要特别处理，没给权限时通话会提示
-    }
 
     private val smsList = mutableStateListOf<Sms>()
     private val storages = mutableStateListOf<Storage>()
@@ -58,25 +42,6 @@ class MainActivity : ComponentActivity() {
     private var backup by mutableStateOf<ConfigBackup?>(null)
     private var identity by mutableStateOf<Identity?>(null)
     private val ifaces = mutableStateListOf<IfaceInfo>()
-
-    // ---------- 通话相关状态 ----------
-    private var call by mutableStateOf(ActiveCall())
-    private val callLog = mutableStateListOf<CallLogEntry>()
-    private var callDurationSec by mutableStateOf(0)
-    private var showDialPad by mutableStateOf(false)
-    private var showCallScreen by mutableStateOf(false)
-    private var currentTab by mutableStateOf(Tab.SMS)
-
-    private val callTimerHandler = Handler(Looper.getMainLooper())
-    private val callTimerRunnable = object : Runnable {
-        override fun run() {
-            if (call.state == CallState.CONNECTED) {
-                callDurationSec++
-                CallService.updateNotif(this@MainActivity, call.number, callDurationSec.toLong())
-                callTimerHandler.postDelayed(this, 1000)
-            }
-        }
-    }
 
     private val prefs: SharedPreferences by lazy {
         getSharedPreferences("modemsms", MODE_PRIVATE)
@@ -123,14 +88,6 @@ class MainActivity : ComponentActivity() {
 
         modem = Modem(this)
         modem.onNewSms = { lifecycleScope.launch { refresh() } }
-        modem.onRinging = { lifecycleScope.launch { handleIncomingCall() } }
-        modem.onCallEnded = { lifecycleScope.launch { handleCallEnded() } }
-
-        // 启动时请求录音权限（通话必须）
-        requestAudioPermissions()
-
-        // 加载通话记录
-        loadCallLog()
 
         val filter = IntentFilter().apply {
             addAction(ACTION_USB_PERMISSION)
@@ -163,24 +120,6 @@ class MainActivity : ComponentActivity() {
                     supported = supported,
                     current = current,
                     snackbar = snackbar,
-                    // 通话相关
-                    currentTab = currentTab,
-                    onTabChange = { currentTab = it },
-                    call = call,
-                    callDurationSec = callDurationSec,
-                    callLog = callLog,
-                    showDialPad = showDialPad,
-                    onToggleDialPad = { showDialPad = !showDialPad },
-                    showCallScreen = showCallScreen,
-                    onCall = { n -> lifecycleScope.launch { startCall(n) } },
-                    onAnswer = { lifecycleScope.launch { answerCall() } },
-                    onHangup = { lifecycleScope.launch { endCall() } },
-                    onToggleMute = { lifecycleScope.launch { toggleMute() } },
-                    onToggleSpeaker = { lifecycleScope.launch { toggleSpeaker() } },
-                    onSendDtmf = { d -> lifecycleScope.launch { sendDtmf(d) } },
-                    onDismissCallScreen = { showCallScreen = false },
-                    onClearCallLog = { clearCallLog() },
-                    // 原有功能
                     onConnect = ::connect,
                     onRefresh = { lifecycleScope.launch { refresh() } },
                     onPickStorage = { s -> lifecycleScope.launch { pickStorage(s) } },
@@ -207,14 +146,6 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         runCatching { unregisterReceiver(usbReceiver) }
-        callTimerHandler.removeCallbacks(callTimerRunnable)
-        // 如果通话中退出，确保挂断
-        if (call.state != CallState.IDLE) {
-            lifecycleScope.launch {
-                runCatching { modem.hangup() }
-                CallService.stop(this@MainActivity)
-            }
-        }
         modem.release()
     }
 
@@ -444,249 +375,5 @@ class MainActivity : ComponentActivity() {
         val err = modem.deleteBulk(flag)
         busy = false
         if (err != null) { snackbar.showSnackbar(err); drainRefresh() } else refresh()
-    }
-
-    // ---------- 通话功能 ----------
-
-    private fun requestAudioPermissions() {
-        val needed = mutableListOf<String>()
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            needed.add(Manifest.permission.RECORD_AUDIO)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                needed.add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-        if (needed.isNotEmpty()) {
-            requestPermissionLauncher.launch(needed.toTypedArray())
-        }
-    }
-
-    /** 发起呼出 */
-    private suspend fun startCall(number: String) {
-        if (!connected || busy) {
-            snackbar.showSnackbar("模块未连接")
-            return
-        }
-        if (number.isBlank()) {
-            snackbar.showSnackbar("请输入号码")
-            return
-        }
-
-        // 检查录音权限
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            snackbar.showSnackbar("需要录音权限才能通话")
-            requestPermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
-            return
-        }
-
-        busy = true
-        showDialPad = false
-        showCallScreen = true
-
-        try {
-            // 关键修复：先配置 USB 音频路径
-            val audioErr = modem.setupUsbAudio()
-            if (audioErr != null) {
-                snackbar.showSnackbar("音频配置警告：$audioErr（可能影响通话音质）")
-            }
-
-            // 启用来电显示（呼入用）
-            modem.enableCallerId()
-
-            // 启动前台服务管理音频路由
-            CallService.start(this, number)
-
-            call = ActiveCall(
-                state = CallState.DIALING,
-                number = number,
-                direction = CallDirection.OUTGOING,
-            )
-            callDurationSec = 0
-
-            val err = modem.dial(number)
-            if (err != null) {
-                snackbar.showSnackbar(err)
-                call = ActiveCall()
-                CallService.stop(this)
-                showCallScreen = false
-                return
-            }
-
-            // 等待接通（最多等30秒）
-            var connected = false
-            repeat(30) {
-                delay(1000)
-                val status = modem.callStatus()
-                if (status == 0) { // 0 = active
-                    connected = true
-                    return@repeat
-                }
-            }
-
-            if (connected) {
-                call = call.copy(state = CallState.CONNECTED, startTime = System.currentTimeMillis())
-                callDurationSec = 0
-                callTimerHandler.post(callTimerRunnable)
-            } else {
-                // 没接通也算一次呼出记录
-                addCallLog(number, CallDirection.OUTGOING, 0)
-                call = ActiveCall()
-                CallService.stop(this)
-                showCallScreen = false
-            }
-        } finally {
-            busy = false
-        }
-    }
-
-    /** 处理来电 */
-    private suspend fun handleIncomingCall() {
-        if (call.state == CallState.CONNECTED) return // 通话中忽略新来电
-
-        val number = modem.lastIncomingNumber() ?: "未知号码"
-        call = ActiveCall(
-            state = CallState.RINGING,
-            number = number,
-            direction = CallDirection.INCOMING,
-        )
-        showCallScreen = true
-
-        // 配置音频（提前准备好，接听时就有声音）
-        modem.setupUsbAudio()
-        modem.enableCallerId()
-    }
-
-    /** 接听来电 */
-    private suspend fun answerCall() {
-        if (call.state != CallState.RINGING) return
-        busy = true
-
-        try {
-            CallService.start(this, call.number)
-            val err = modem.answer()
-            if (err != null) {
-                snackbar.showSnackbar(err)
-                return
-            }
-            call = call.copy(state = CallState.CONNECTED, startTime = System.currentTimeMillis())
-            callDurationSec = 0
-            callTimerHandler.post(callTimerRunnable)
-        } finally {
-            busy = false
-        }
-    }
-
-    /** 结束通话 */
-    private suspend fun endCall() {
-        val wasConnected = call.state == CallState.CONNECTED
-        val number = call.number
-        val direction = call.direction
-        val duration = callDurationSec
-
-        callTimerHandler.removeCallbacks(callTimerRunnable)
-
-        runCatching { modem.hangup() }
-        CallService.stop(this)
-
-        // 记录通话记录
-        if (direction == CallDirection.INCOMING && call.state == CallState.RINGING) {
-            // 未接来电
-            addCallLog(number, direction, 0, missed = true)
-        } else if (wasConnected || call.state == CallState.DIALING) {
-            addCallLog(number, direction, duration)
-        }
-
-        call = ActiveCall()
-        callDurationSec = 0
-        showCallScreen = false
-        busy = false
-    }
-
-    /** 通话被对方挂断 */
-    private suspend fun handleCallEnded() {
-        if (call.state == CallState.IDLE) return
-        endCall()
-    }
-
-    /** 切换静音 */
-    private suspend fun toggleMute() {
-        call = call.copy(muted = !call.muted)
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        am.isMicrophoneMute = call.muted
-        CallService.toggleMute(this)
-    }
-
-    /** 切换免提 */
-    private suspend fun toggleSpeaker() {
-        call = call.copy(speakerOn = !call.speakerOn)
-        CallService.toggleSpeaker(this)
-    }
-
-    /** 发送DTMF */
-    private suspend fun sendDtmf(digit: Char) {
-        if (call.state != CallState.CONNECTED) return
-        modem.sendDtmf(digit)
-    }
-
-    // ---------- 通话记录 ----------
-
-    private fun addCallLog(
-        number: String,
-        direction: CallDirection,
-        durationSec: Int,
-        missed: Boolean = false
-    ) {
-        val entry = CallLogEntry(
-            number = number,
-            direction = direction,
-            startTime = System.currentTimeMillis(),
-            durationSec = durationSec,
-            missed = missed,
-        )
-        callLog.add(0, entry)
-        saveCallLog()
-    }
-
-    private fun clearCallLog() {
-        callLog.clear()
-        prefs.edit().remove(KEY_CALL_LOG).apply()
-    }
-
-    private fun loadCallLog() {
-        val raw = prefs.getString(KEY_CALL_LOG, null) ?: return
-        runCatching {
-            val entries = raw.split("||").mapNotNull { line ->
-                val parts = line.split("|")
-                if (parts.size >= 4) {
-                    CallLogEntry(
-                        id = parts[0].toLongOrNull() ?: 0,
-                        number = parts[1],
-                        direction = if (parts[2] == "0") CallDirection.OUTGOING else CallDirection.INCOMING,
-                        startTime = parts[3].toLongOrNull() ?: 0,
-                        durationSec = parts.getOrNull(4)?.toIntOrNull() ?: 0,
-                        missed = parts.getOrNull(5) == "1",
-                    )
-                } else null
-            }
-            callLog.clear()
-            callLog.addAll(entries.sortedByDescending { it.id })
-        }
-    }
-
-    private fun saveCallLog() {
-        val raw = callLog.joinToString("||") {
-            "${it.id}|${it.number}|${if (it.direction == CallDirection.OUTGOING) 0 else 1}|" +
-                "${it.startTime}|${it.durationSec}|${if (it.missed) 1 else 0}"
-        }
-        prefs.edit().putString(KEY_CALL_LOG, raw).apply()
-    }
-
-    companion object {
-        private const val KEY_CALL_LOG = "call_log"
     }
 }
